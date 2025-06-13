@@ -10,11 +10,10 @@ import re
 import ttkbootstrap as ttk
 import json
 import logging
+import sys
 
 QUEUE_FILE = "download_queue.json"
 
-# --- Logging Setup (Simplified) ---
-# Configure root logger to output to console
 logger = logging.getLogger()
 logger.setLevel(logging.INFO) # Set a default logging level
 
@@ -25,7 +24,13 @@ formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datef
 console_handler.setFormatter(formatter) # CORRECTED LINE: Set the formatter object
 logger.addHandler(console_handler)
 # --- End Logging Setup ---
+def get_ffmpeg_path():
+    if getattr(sys, 'frozen', False):  # if running from PyInstaller bundle
+        return os.path.join(sys._MEIPASS, 'ffmpeg.exe')
+    else:
+        return 'ffmpeg'  # fallback to system ffmpeg for development
 
+ffmpeg_path = get_ffmpeg_path()
 
 def sanitize_filename(filename):
     safe_filename = "".join(c if c.isalnum() or c in (' ', '.', '_', '-', '(', ')') else '_' for c in filename)
@@ -74,7 +79,7 @@ class DownloadJob:
 
 class YTDownloaderApp(ttk.Window):
     def __init__(self):
-        super().__init__() 
+        super().__init__(themename="cyborg")
 
         try:
             from ctypes import windll
@@ -90,11 +95,16 @@ class YTDownloaderApp(ttk.Window):
         self.minsize(600, 400)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        # Store original dimensions
+        self.original_width = 900
+        self.original_height = 600
+        self.was_zoomed = False
+
         self.jobs = []
         self.jobs_lock = threading.Lock()
         self.ui_update_interval = 0.5
-        self.min_update_interval = 0.5  # ADD THIS
-        self.max_update_interval = 2.0  # ADD THIS
+        self.min_update_interval = 0.5
+        self.max_update_interval = 2.0
 
         self.ui_queue = queue.Queue()
 
@@ -108,6 +118,36 @@ class YTDownloaderApp(ttk.Window):
 
     def _setup_scrolling(self):
         """Set up scrolling behavior for Windows after window is fully loaded"""
+        def on_state_change(event):
+            if event.widget == self:
+                if self.state() == 'zoomed':
+                    self.was_zoomed = True
+                elif self.state() == 'normal' and self.was_zoomed:
+                    self.was_zoomed = False
+                    self.geometry(f"{self.original_width}x{self.original_height}")
+                    
+                    # Force complete UI refresh
+                    self.update_idletasks()
+                    self.main_canvas.itemconfig(self.canvas_window, width=self.original_width, height=self.original_height)
+                    self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+                    
+                    # Force all widgets to update their layout
+                    for widget in self.scrollable_frame.winfo_children():
+                        widget.update_idletasks()
+                    
+                    # Trigger a UI update through the queue
+                    self.ui_queue.put((None, 'status_update', "Window restored", "Window restored"))
+                    
+                    # Force immediate UI update
+                    self._check_ui_queue()
+                    
+                    # Additional update after a short delay to ensure everything is refreshed
+                    self.after(100, lambda: [
+                        self.update_idletasks(),
+                        self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all")),
+                        self._check_ui_queue()
+                    ])
+
         def check_scroll_needed():
             self.main_canvas.update_idletasks()
             self.scrollable_frame.update_idletasks()
@@ -124,6 +164,7 @@ class YTDownloaderApp(ttk.Window):
                 self.main_canvas.itemconfig(self.canvas_window, width=canvas_width, height=canvas_height)
                 self.main_canvas.configure(scrollregion=(0, 0, canvas_width, canvas_height))
             else:
+                # Normal or minimized state: show scrollbars if needed
                 if frame_height > canvas_height:
                     self.v_scrollbar.grid(row=0, column=1, sticky='ns')
                 else:
@@ -135,8 +176,10 @@ class YTDownloaderApp(ttk.Window):
                     self.h_scrollbar.grid_forget()
 
                 self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+                if frame_width < canvas_width:
+                    self.main_canvas.itemconfig(self.canvas_window, width=canvas_width)
 
-        
+        self.bind('<Configure>', on_state_change)
         self.main_canvas.bind('<Configure>', lambda e: check_scroll_needed())
         self.scrollable_frame.bind('<Configure>', lambda e: check_scroll_needed())
         self.bind('<Configure>', lambda e: check_scroll_needed())
@@ -216,47 +259,85 @@ class YTDownloaderApp(ttk.Window):
         main_container.grid_rowconfigure(0, weight=1)
         main_container.grid_columnconfigure(0, weight=1)
 
-        # Create canvas
+        # Create canvas with proper configuration
         self.main_canvas = tk.Canvas(main_container, highlightthickness=0)
         self.main_canvas.grid(row=0, column=0, sticky='nsew')
         
         # Create scrollbars
         self.v_scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=self.main_canvas.yview)
+        self.v_scrollbar.grid(row=0, column=1, sticky='ns')
+        
         self.h_scrollbar = ttk.Scrollbar(main_container, orient="horizontal", command=self.main_canvas.xview)
+        self.h_scrollbar.grid(row=1, column=0, sticky='ew')
         
         # Create scrollable frame
         self.scrollable_frame = ttk.Frame(self.main_canvas)
-
-        # Configure canvas window
-        self.canvas_window = self.main_canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        
+        # Configure canvas window with proper options
+        self.canvas_window = self.main_canvas.create_window(
+            (0, 0),
+            window=self.scrollable_frame,
+            anchor="nw",
+            tags="scrollable_frame"
+        )
         
         self.main_canvas.configure(
             yscrollcommand=self.v_scrollbar.set,
             xscrollcommand=self.h_scrollbar.set
         )
-        
-        def configure_scroll_region(event=None):
-            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
-            
-            canvas_width = self.main_canvas.winfo_width()
-            frame_width = self.scrollable_frame.winfo_reqwidth()
-            if frame_width < canvas_width:
-                self.main_canvas.itemconfig(self.canvas_window, width=canvas_width)
-        
-        self.scrollable_frame.bind("<Configure>", configure_scroll_region)
 
-        # Create all widgets inside scrollable_frame with minimum width constraint
+        # Create all widgets inside scrollable_frame
         content_frame = ttk.Frame(self.scrollable_frame)
         content_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        # Setup update handling
+        self._update_pending = False
+        self._last_update = 0
+        self._update_interval = 16  # ~60fps
+
+        def configure_scroll_region(event=None):
+            if not self._update_pending:
+                self._update_pending = True
+                current_time = time.time() * 1000  # Convert to milliseconds
+                
+                if current_time - self._last_update >= self._update_interval:
+                    self._last_update = current_time
+                    self._update_pending = False
+                    
+                    # Update scroll region
+                    self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+                    
+                    # Update canvas window width
+                    canvas_width = self.main_canvas.winfo_width()
+                    if canvas_width > 1:
+                        self.main_canvas.itemconfig(self.canvas_window, width=canvas_width)
+                else:
+                    # Schedule update for next frame
+                    self.after(1, configure_scroll_region)
+
+        # Bind configure events with debouncing
+        self.scrollable_frame.bind("<Configure>", configure_scroll_region)
+        self.main_canvas.bind("<Configure>", configure_scroll_region)
         
+        # Add resize handling
+        def on_resize(event):
+            configure_scroll_region()
+        
+        self.bind("<Configure>", on_resize)
+        
+        # Initial layout
+        self.update_idletasks()
+        configure_scroll_region()
+
         # Main input frame
         frame = ttk.Frame(content_frame, padding="10")
         frame.pack(fill='x')
         frame.grid_columnconfigure(1, weight=1) 
 
-        ttk.Label(frame, text="YouTube URL:").grid(row=0, column=0, sticky='w', pady=(0,2))
+        ttk.Label(frame, text="Enter URL:").grid(row=0, column=0, sticky='w', pady=(0,2))
         self.url_entry = ttk.Entry(frame, width=70)
         self.url_entry.grid(row=0, column=1, sticky='ew', pady=(0,5))
+        self.url_entry.bind('<Return>', lambda e: self.fetch_info())  # Add Enter key binding
 
         ttk.Button(frame, text="Fetch Info", command=self.fetch_info).grid(row=0, column=2, padx=5, pady=(0,5))
 
@@ -288,7 +369,7 @@ class YTDownloaderApp(ttk.Window):
         self.sub_lang_combo.current(0)
 
         ttk.Label(frame, text="Output Folder:").grid(row=6, column=0, sticky='w', pady=(5,2))
-        default_output_dir = os.path.join(os.path.expanduser("~"), "Videos", "Youtube")
+        default_output_dir = os.path.join(os.path.expanduser("~"), "Videos")
         os.makedirs(default_output_dir, exist_ok=True)
         self.out_dir_var = tk.StringVar(value=default_output_dir)
         out_dir_entry = ttk.Entry(frame, textvariable=self.out_dir_var, width=55)
@@ -476,7 +557,7 @@ class YTDownloaderApp(ttk.Window):
     def fetch_info(self):
         url = self.url_entry.get().strip()
         if not url:
-            messagebox.showwarning("Input error", "Please enter a YouTube URL.")
+            messagebox.showwarning("Input error", "Please enter a Valid URL.")
             logger.warning("Attempted to fetch info with empty URL.")
             return
 
@@ -577,29 +658,95 @@ class YTDownloaderApp(ttk.Window):
         if choice == 'video':
             combined_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('acodec') != 'none']
             video_only_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('acodec') == 'none']
-            # video_only_formats.sort(key=lambda x: (x.get('height', 0), x.get('filesize', 0) or x.get('filesize_approx', 0)), reverse=True)
+
+            # Sort combined formats by resolution (low to high)
+            combined_formats.sort(key=lambda x: (
+                x.get('height', 0),  # Sort by height (resolution)
+                x.get('filesize', 0) or x.get('filesize_approx', 0)  # Then by size
+            ))  # Removed reverse=True for low to high sorting
 
             # Add combined formats
             for f in combined_formats:
                 size_bytes = f.get('filesize') or f.get('filesize_approx') or 0
                 size_mb_str = f"{size_bytes / 1024 / 1024:.2f} MB" if size_bytes else "Unknown"
-                res = f"{f.get('width', '?')}x{f.get('height', '?')}"
+                height = f.get('height', 0)
+                res = f"{f.get('width', '?')}x{height}"
                 ext = f.get('ext', 'N/A')
                 fps = f.get('fps', '?')
                 abr = f.get('abr', '?') # Audio Bitrate
-                display_text = f"{idx}. {res} ({ext}) | {size_mb_str} | {fps}fps | Audio: {abr}k (Combined)"
+                
+                # Add resolution label
+                res_label = ""
+                if height >= 15360:
+                    res_label = "32K"
+                elif height >= 7680:
+                    res_label = "16K"
+                elif height >= 4320:
+                    res_label = "8k"
+                elif height >= 2160:
+                    res_label = "4K"
+                elif height >= 1440:
+                    res_label = "2K"
+                elif height >= 1080:
+                    res_label = "1080p"
+                elif height >= 720:
+                    res_label = "720p"
+                elif height >= 480:
+                    res_label = "480p"
+                elif height >= 360:
+                    res_label = "360p"
+                elif height >= 240:
+                    res_label = "240p"
+                elif height >= 144:
+                    res_label = "144p"
+                
+                display_text = f"{idx}. {res_label} ({res}) | {size_mb_str} | {fps}fps | Audio: {abr}k"
                 self.format_listbox.insert('end', display_text)
                 self.candidates.append(f)
                 idx += 1
+
+            # Sort video-only formats by resolution (low to high)
+            video_only_formats.sort(key=lambda x: (
+                x.get('height', 0),  # Sort by height (resolution)
+                x.get('filesize', 0) or x.get('filesize_approx', 0)  # Then by size
+            ))  # Removed reverse=True for low to high sorting
 
             # Add video-only formats
             for f in video_only_formats:
                 size_bytes = f.get('filesize') or f.get('filesize_approx') or 0
                 size_mb_str = f"{size_bytes / 1024 / 1024:.2f} MB" if size_bytes else "Unknown"
-                res = f"{f.get('width', '?')}x{f.get('height', '?')}"
+                height = f.get('height', 0)
+                res = f"{f.get('width', '?')}x{height}"
                 ext = f.get('ext', 'N/A')
                 fps = f.get('fps', '?')
-                display_text = f"{idx}. {res} ({ext}) | {size_mb_str} | {fps}fps (Video Only)"
+                
+                # Add resolution label
+                res_label = ""
+                if height >= 15360:
+                    res_label = "32K"
+                elif height >= 7680:
+                    res_label = "16K"
+                elif height >= 4320:
+                    res_label = "8K"
+                elif height >= 2160:
+                    res_label = "4K"
+                elif height >= 1440:
+                    res_label = "2K"
+                elif height >= 1080:
+                    res_label = "1080p"
+                elif height >= 720:
+                    res_label = "720p"
+                elif height >= 480:
+                    res_label = "480p"
+                elif height >= 360:
+                    res_label = "360p"
+                elif height >= 240:
+                    res_label = "240p"
+                elif height >= 144:
+                    res_label = "144p"
+
+
+                display_text = f"{idx}. {res_label} ({res}) | {size_mb_str} | {fps}fps (Video Only)"
                 self.format_listbox.insert('end', display_text)
                 self.candidates.append(f)
                 idx += 1
@@ -610,22 +757,24 @@ class YTDownloaderApp(ttk.Window):
                 logger.info("No video formats found for the current video.")
 
         elif choice == 'audio':
+            # Get all audio formats
             audio_formats = [f for f in formats if f.get('acodec') != 'none']
-            audio_formats.sort(key=lambda x: (x.get('abr', 0), x.get('filesize', 0) or x.get('filesize_approx', 0)), reverse=True)
+            
+            # Sort by audio quality (abr)
+            audio_formats.sort(key=lambda x: (x.get('abr', 0) or 0), reverse=True)
 
             # Add a general "Best Audio" option first
-            display_text = "1. Best Audio (MP3 320kbps) - recommended"
+            display_text = "1. Best Audio (320kbps) - recommended"
             self.format_listbox.insert('end', display_text)
-            self.candidates.append({"format_id": "bestaudio/best_dummy_format_id", "is_best_audio_option": True})
+            self.candidates.append({"format_id": "bestaudio/best", "is_best_audio_option": True})
             idx += 1
 
             # Add other available audio formats
             for f in audio_formats:
                 size_bytes = f.get('filesize') or f.get('filesize_approx') or 0
                 size_mb_str = f"{size_bytes / 1024 / 1024:.2f} MB" if size_bytes else "Unknown"
-                ext = f.get('ext', 'N/A')
                 abr = f.get('abr', '?') # Audio Bitrate
-                display_text = f"{idx}. {ext} | {size_mb_str} | {abr}kbps"
+                display_text = f"{idx}. {abr}kbps | {size_mb_str}"
                 self.format_listbox.insert('end', display_text)
                 self.candidates.append(f)
                 idx += 1
@@ -636,6 +785,7 @@ class YTDownloaderApp(ttk.Window):
                 logger.info("No audio formats found for the current video.")
         
         self.on_format_select(None)
+        # Select the first valid item if available
         if self.candidates and not self.candidates[0].get("dummy"):
             self.format_listbox.selection_set(0)
             self.on_format_select(None) # Manually trigger selection update
@@ -817,6 +967,28 @@ class YTDownloaderApp(ttk.Window):
                 self.save_queue()
                 return
 
+            # Download thumbnail first
+            thumbnail_path = None
+            try:
+                ydl_opts_thumb = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'writethumbnail': True,
+                    'outtmpl': f"{base_outtmpl_no_ext}.%(ext)s",
+                    'skip_download': True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts_thumb) as ydl:
+                    info = ydl.extract_info(job.url, download=True)
+                    # Find the downloaded thumbnail file
+                    for ext in ['jpg', 'webp', 'png']:
+                        possible_thumb = f"{base_outtmpl_no_ext}.{ext}"
+                        if os.path.exists(possible_thumb):
+                            thumbnail_path = possible_thumb
+                            break
+                logger.info(f"Thumbnail downloaded for '{job.title}' to {thumbnail_path}")
+            except Exception as e:
+                logger.warning(f"Failed to download thumbnail for '{job.title}': {e}")
+
             ydl_opts = {
                 'outtmpl': f"{base_outtmpl_no_ext}.%(ext)s",
                 'noplaylist': True,
@@ -893,62 +1065,92 @@ class YTDownloaderApp(ttk.Window):
                     self.ui_queue.put((job.tree_item_id, 'status_update', "Processing", f"Merging video and audio for: {job.title}"))
                     logger.info(f"Starting merge process for '{job.title}' (Video: {video_file_path}, Audio: {audio_file_path}) to {final_mp4_path}.")
 
-                    ffmpeg_cmd = [
-                        "ffmpeg",
-                        "-i", video_file_path,
-                        "-i", audio_file_path,
-                        "-c:v", "copy",
-                        "-c:a", "aac",
-                        "-b:a", "320k",
-                        "-map", "0:v:0",
-                        "-map", "1:a:0",
-                        "-y",
-                        final_mp4_path
-                    ]
-
-                    try:
-                        subprocess.run(["ffmpeg", "-version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    except (subprocess.CalledProcessError, FileNotFoundError):
-                        logger.error("FFmpeg not found or not in PATH. Required for merging/conversion.")
-                        raise Exception("FFmpeg is not installed or not in your system's PATH. It's required for video/audio merging and conversion.")
-
-                    process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-                    
-                    job.status = "Processing"
-                    job.progress = 99.9
-                    job.eta = "Processing..."
-                    job.speed = "N/A"
-                    
-                    while True:
-                        if job.stop_event.is_set():
-                            process.terminate()
-                            job.status = "Paused"
-                            self.ui_queue.put((job.tree_item_id, 'status_update', job.status, f"Download {job.title} paused during merging."))
-                            logger.info(f"Merge for '{job.title}' paused by user.")
-                            break
-
-                        line = process.stdout.readline()
-                        if not line:
-                            break
-                        logger.debug(f"FFmpeg output for '{job.title}': {line.strip()}")
-                
-                        if time.time() - job.last_ui_update_time > self.ui_update_interval:
-                            if job.progress < 100:
-                                job.progress = min(job.progress + 0.01, 99.9)
-                            self.ui_queue.put((job.tree_item_id, 'status_update', job.status, f"Processing {job.title}: {job.progress:.1f}%"))
-                            self.ui_queue.put((job.tree_item_id, 'progress'))
-                            job.last_ui_update_time = time.time()
-                    
-                    process.wait()
-                    if process.returncode != 0 and not job.stop_event.is_set():
-                        logger.error(f"FFmpeg merging for '{job.title}' failed with exit code {process.returncode}. Output: {process.communicate()[0]}")
-                        raise Exception(f"FFmpeg merging failed with exit code {process.returncode}")
+                    # Add thumbnail if available
+                    if thumbnail_path:
+                        try:
+                            # Convert thumbnail to JPEG properly
+                            jpeg_thumb = thumbnail_path.replace('.webp', '.jpg')
+                            convert_cmd = [
+                                ffmpeg_path,
+                                "-i", thumbnail_path,
+                                "-vcodec", "mjpeg",
+                                "-q:v", "2",
+                                "-y",
+                                jpeg_thumb
+                            ]
+                            logger.info(f"Converting thumbnail to JPEG: {' '.join(convert_cmd)}")
+                            convert_result = subprocess.run(convert_cmd, capture_output=True, text=True,creationflags=subprocess.CREATE_NO_WINDOW)
+                            if convert_result.returncode != 0:
+                                logger.error(f"Thumbnail conversion error: {convert_result.stderr}")
+                                raise Exception("Failed to convert thumbnail")
+                            
+                            # Merge video, audio and add thumbnail
+                            ffmpeg_cmd = [
+                                ffmpeg_path,
+                                "-i", video_file_path,
+                                "-i", audio_file_path,
+                                "-i", jpeg_thumb,
+                                "-map", "0:v",
+                                "-map", "1:a",
+                                "-map", "2",
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-b:a", "320k",
+                                "-disposition:v:1", "attached_pic",
+                                "-y",
+                                final_mp4_path
+                            ]
+                            logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+                            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True,creationflags=subprocess.CREATE_NO_WINDOW)
+                            if result.returncode != 0:
+                                logger.error(f"FFmpeg error: {result.stderr}")
+                                raise Exception(f"FFmpeg failed with error: {result.stderr}")
+                            
+                            # Clean up JPEG thumbnail
+                            if os.path.exists(jpeg_thumb):
+                                os.remove(jpeg_thumb)
+                            
+                        except Exception as e:
+                            logger.error(f"Error during FFmpeg processing: {str(e)}")
+                            # Fallback to simple merge without thumbnail
+                            ffmpeg_cmd = [
+                                ffmpeg_path,
+                                "-i", video_file_path,
+                                "-i", audio_file_path,
+                                "-c:v", "copy",
+                                "-c:a", "aac",
+                                "-b:a", "320k",
+                                "-y",
+                                final_mp4_path
+                            ]
+                            logger.info("Falling back to simple merge without thumbnail")
+                            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
+                    else:
+                        ffmpeg_cmd = [
+                            ffmpeg_path,
+                            "-i", video_file_path,
+                            "-i", audio_file_path,
+                            "-c:v", "copy",
+                            "-c:a", "aac",
+                            "-b:a", "320k",
+                            "-y",
+                            final_mp4_path
+                        ]
+                        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
 
                     for temp_f in job.temp_files:
                         if os.path.exists(temp_f):
                             os.remove(temp_f)
                             logger.debug(f"Cleaned up temp file: {temp_f}")
                     job.temp_files.clear()
+
+                    # Clean up thumbnail if it exists
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        try:
+                            os.remove(thumbnail_path)
+                            logger.debug(f"Cleaned up thumbnail file: {thumbnail_path}")
+                        except Exception as e:
+                            logger.error(f"Error cleaning up thumbnail file {thumbnail_path}: {e}")
 
                     job.status = "Completed"
                     job.progress = 100
@@ -966,6 +1168,30 @@ class YTDownloaderApp(ttk.Window):
                     logger.info(f"Starting combined video/audio download for '{job.title}' (Format ID: {job.format_info['format_id']}).")
                     with yt_dlp.YoutubeDL(ydl_opts_combined) as ydl:
                         ydl.download([job.url])
+                    
+                    # Apply thumbnail if available - only for MKV output
+                    if thumbnail_path and os.path.exists(thumbnail_path):
+                        try:
+                            temp_output = f"{final_path}.temp"
+                            # Convert to MKV if it's not already
+                            if not final_path.endswith('.mkv'):
+                                final_path = final_path.replace('.mp4', '.mkv')
+                            ffmpeg_cmd = [
+                               ffmpeg_path,
+                                "-i", final_path,
+                                "-i", thumbnail_path,
+                                "-map", "0",
+                                "-map", "1",
+                                "-c", "copy",
+                                "-disposition:v:1", "attached_pic",
+                                "-y",
+                                temp_output
+                            ]
+                            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
+                            os.replace(temp_output, final_path)
+                            logger.info(f"Applied thumbnail to video for '{job.title}'")
+                        except Exception as e:
+                            logger.error(f"Failed to apply thumbnail to video for '{job.title}': {e}")
                     
                     if not job.stop_event.is_set():
                         job.status = "Completed"
@@ -1018,6 +1244,34 @@ class YTDownloaderApp(ttk.Window):
                 with yt_dlp.YoutubeDL(ydl_opts_audio) as ydl:
                     ydl.download([job.url])
 
+                # Apply thumbnail to MP3 if available
+                if thumbnail_path and os.path.exists(thumbnail_path):
+                    try:
+                        temp_output = f"{final_mp3_path}.temp"
+                        ffmpeg_cmd = [
+                            ffmpeg_path,
+                            "-i", final_mp3_path,
+                            "-i", thumbnail_path,
+                            "-map", "0",
+                            "-map", "1",
+                            "-c", "copy",
+                            "-id3v2_version", "3",
+                            "-metadata:s:v:1", "title=Cover",
+                            "-metadata:s:v:1", "comment=Cover (front)",
+                            "-y",
+                            temp_output
+                        ]
+                        logger.info(f"Running MP3 thumbnail command: {' '.join(ffmpeg_cmd)}")
+                        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,creationflags=subprocess.CREATE_NO_WINDOW)
+                        os.replace(temp_output, final_mp3_path)
+                        logger.info(f"Applied thumbnail to MP3 for '{job.title}'")
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"FFmpeg error output: {e.stderr.decode() if e.stderr else 'No error output'}")
+                        raise Exception(f"FFmpeg failed: {str(e)}")
+                    except Exception as e:
+                        logger.error(f"Unexpected error: {str(e)}")
+                        raise
+
                 if not job.stop_event.is_set():
                     job.status = "Completed"
                     job.progress = 100
@@ -1061,34 +1315,99 @@ class YTDownloaderApp(ttk.Window):
             else:
                 job.status = "Error"
                 error_detail = str(e)
-                if "FFmpeg" in str(e) and ("not found" in str(e) or "executable not found" in str(e)):
+                if ffmpeg_path in str(e) and ("not found" in str(e) or "executable not found" in str(e)):
                     error_detail = "FFmpeg is missing or not in PATH, needed for this conversion/merging. Please install FFmpeg."
                 elif "no appropriate format" in str(e).lower():
                     error_detail = "No suitable format found for the selected options or URL."
                 self.ui_queue.put((job.tree_item_id, 'error', f"Error downloading {job.title}:\n{error_detail}"))
                 self.ui_queue.put((job.tree_item_id, 'status_update', job.status, f"Error on download: {job.title}"))
                 logger.error(f"DownloadError for '{job.title}': {error_detail}")
-            for temp_f in job.temp_files:
-                if os.path.exists(temp_f):
-                    try:
-                        os.remove(temp_f)
-                        logger.debug(f"Cleaned up temp file on yt-dlp error: {temp_f}")
-                    except Exception as e_clean:
-                        logger.error(f"Error cleaning up temp file {temp_f} on yt-dlp error: {e_clean}")
-            job.temp_files.clear()
+                
+                # Clean up any downloaded files on error
+                try:
+                    # Clean up temp files
+                    for temp_f in job.temp_files:
+                        if os.path.exists(temp_f):
+                            try:
+                                os.remove(temp_f)
+                                logger.debug(f"Cleaned up temp file on yt-dlp error: {temp_f}")
+                            except Exception as e_clean:
+                                logger.error(f"Error cleaning up temp file {temp_f} on yt-dlp error: {e_clean}")
+                    job.temp_files.clear()
+
+                    # Clean up any partial downloads in the output directory
+                    base_outtmpl_no_ext = os.path.join(job.out_dir, sanitize_filename(job.title))
+                    for ext in [ '.mp3', '.aac', '.m4a']:
+                        # Check for both direct and numbered files
+                        possible_files = [
+                            f"{base_outtmpl_no_ext}{ext}",
+                            f"{base_outtmpl_no_ext}_video{ext}",
+                            f"{base_outtmpl_no_ext}_audio{ext}"
+                        ]
+                        # Also check for numbered files (1), (2), etc.
+                        counter = 1
+                        while True:
+                            numbered_file = f"{base_outtmpl_no_ext}({counter}){ext}"
+                            if not os.path.exists(numbered_file):
+                                break
+                            possible_files.append(numbered_file)
+                            counter += 1
+
+                        for file_path in possible_files:
+                            if os.path.exists(file_path):
+                                try:
+                                    os.remove(file_path)
+                                    logger.debug(f"Cleaned up partial download file: {file_path}")
+                                except Exception as e_clean:
+                                    logger.error(f"Error cleaning up partial download file {file_path}: {e_clean}")
+                except Exception as cleanup_error:
+                    logger.error(f"Error during cleanup of failed download files: {cleanup_error}")
+
         except Exception as e:
             job.status = "Error"
             self.ui_queue.put((job.tree_item_id, 'error', f"An unexpected error occurred downloading {job.title}:\n{e}"))
             self.ui_queue.put((job.tree_item_id, 'status_update', job.status, f"Error on download: {job.title}"))
             logger.exception(f"An unexpected error occurred in download_worker for '{job.title}'.") # Log full traceback
-            for temp_f in job.temp_files:
-                if os.path.exists(temp_f):
-                    try:
-                        os.remove(temp_f)
-                        logger.debug(f"Cleaned up temp file on unexpected error: {temp_f}")
-                    except Exception as e_clean:
-                        logger.error(f"Error cleaning up temp file {temp_f} on unexpected error: {e_clean}")
-            job.temp_files.clear()
+            
+            # Clean up any downloaded files on error
+            try:
+                # Clean up temp files
+                for temp_f in job.temp_files:
+                    if os.path.exists(temp_f):
+                        try:
+                            os.remove(temp_f)
+                            logger.debug(f"Cleaned up temp file on unexpected error: {temp_f}")
+                        except Exception as e_clean:
+                            logger.error(f"Error cleaning up temp file {temp_f} on unexpected error: {e_clean}")
+                job.temp_files.clear()
+
+                # Clean up any partial downloads in the output directory
+                base_outtmpl_no_ext = os.path.join(job.out_dir, sanitize_filename(job.title))
+                for ext in [ '.mp4','.mp3', '.aac', '.m4a']:
+                    # Check for both direct and numbered files
+                    possible_files = [
+                        f"{base_outtmpl_no_ext}{ext}",
+                        f"{base_outtmpl_no_ext}_video{ext}",
+                        f"{base_outtmpl_no_ext}_audio{ext}"
+                    ]
+                    # # Also check for numbered files (1), (2), etc.
+                    # counter = 1
+                    # while True:
+                    #     numbered_file = f"{base_outtmpl_no_ext}({counter}){ext}"
+                    #     if not os.path.exists(numbered_file):
+                    #         break
+                    #     possible_files.append(numbered_file)
+                    #     counter += 1
+
+                    for file_path in possible_files:
+                        if os.path.exists(file_path):
+                            try:
+                                os.remove(file_path)
+                                logger.debug(f"Cleaned up partial download file: {file_path}")
+                            except Exception as e_clean:
+                                logger.error(f"Error cleaning up partial download file {file_path}: {e_clean}")
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup of failed download files: {cleanup_error}")
         finally:
             self.save_queue()
             logger.info(f"Download worker for '{job.title}' finished.")
@@ -1295,6 +1614,8 @@ class YTDownloaderApp(ttk.Window):
                 job.thread.join(timeout=3) # Wait for thread to finish
                 if job.thread.is_alive():
                     logger.warning(f"Thread for '{job.title}' did not terminate gracefully within timeout.")
+            
+            # Clean up temp files
             for temp_f in job.temp_files:
                 if os.path.exists(temp_f):
                     try:
@@ -1303,6 +1624,85 @@ class YTDownloaderApp(ttk.Window):
                     except Exception as e:
                         logger.error(f"Error cleaning up temp file {temp_f} for '{job.title}': {e}")
             job.temp_files.clear()
+
+            # Clean up any partial downloads in the output directory
+            try:
+                base_outtmpl_no_ext = os.path.join(job.out_dir, sanitize_filename(job.title))
+                base_name = os.path.basename(base_outtmpl_no_ext)
+                sanitized_title = sanitize_filename(job.title)
+                valid_media_exts = ['.mp4', '.mp3', '.mkv', '.webm', '.aac', '.m4a', '.flac', '.wav']
+                
+                # Function to attempt file deletion with retries
+                def try_remove_file(file_path, max_retries=5, delay=0.7):
+                    for attempt in range(max_retries):
+                        try:
+                            if os.path.exists(file_path):
+                                os.remove(file_path)
+                                logger.debug(f"Cleaned up file: {file_path}")
+                                return True
+                        except Exception as e:
+                            if attempt < max_retries - 1:
+                                logger.debug(f"Retry {attempt + 1}/{max_retries} for {file_path}: {e}")
+                                time.sleep(delay)
+                            else:
+                                logger.error(f"Failed to clean up file {file_path} after {max_retries} attempts: {e}")
+                    return False
+
+                # Clean up partial/extensionless files (but NOT the main completed file)
+                for ext in ['.mp4', '.mp3', '.aac', '.m4a', '.webm', '.part', '.webp']:
+                    # Only delete if not a valid completed file
+                    if ext in valid_media_exts:
+                        # Only delete _video, _audio, and numbered files, NOT the main file
+                        possible_files = [
+                            f"{base_outtmpl_no_ext}_video{ext}",
+                            f"{base_outtmpl_no_ext}_audio{ext}",
+                            f"{sanitized_title}_video{ext}",
+                            f"{sanitized_title}_audio{ext}"
+                        ]
+                    else:
+                        # For .part, .webp, etc., also include the base and sanitized title
+                        possible_files = [
+                            f"{base_outtmpl_no_ext}{ext}",
+                            f"{base_outtmpl_no_ext}_video{ext}",
+                            f"{base_outtmpl_no_ext}_audio{ext}",
+                            f"{sanitized_title}{ext}",
+                            f"{sanitized_title}_video{ext}",
+                            f"{sanitized_title}_audio{ext}"
+                        ]
+
+                # Clean up extensionless temp files (_video, _audio only)
+                extensionless_files = [
+                    f"{base_outtmpl_no_ext}_video",
+                    f"{base_outtmpl_no_ext}_audio",
+                    f"{sanitized_title}_video",
+                    f"{sanitized_title}_audio"
+                ]
+                for file_path in extensionless_files:
+                    try_remove_file(file_path)
+
+                # Clean up fragment files (*.part-Frag*.part) in both output directory and current directory
+                directories_to_check = [job.out_dir, os.getcwd()]
+                for directory in directories_to_check:
+                    if os.path.isdir(directory):
+                        for filename in os.listdir(directory):
+                            # Check for fragment files that match the base name or sanitized title
+                            if ((filename.startswith(base_name) or filename.startswith(sanitized_title)) and 
+                                ('.part-Frag' in filename or filename.endswith('.part') or filename.endswith('.webp'))):
+                                file_path = os.path.join(directory, filename)
+                                try_remove_file(file_path, max_retries=8, delay=1.0)
+
+                # Final check and cleanup after a short delay
+                time.sleep(2)
+                for directory in directories_to_check:
+                    if os.path.isdir(directory):
+                        for filename in os.listdir(directory):
+                            if ((filename.startswith(base_name) or filename.startswith(sanitized_title)) and 
+                                ('.part-Frag' in filename or filename.endswith('.part') or filename.endswith('.webp'))):
+                                file_path = os.path.join(directory, filename)
+                                try_remove_file(file_path, max_retries=4, delay=0.5)
+
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup of partial download files: {cleanup_error}")
 
             with self.jobs_lock:
                 if job in self.jobs:
@@ -1361,33 +1761,156 @@ class YTDownloaderApp(ttk.Window):
             return
 
         logger.info("User confirmed clearing the entire queue.")
-        with self.jobs_lock:
-            for job in self.jobs:
-                if job.thread and job.thread.is_alive():
-                    job.stop_event.set()
-                    logger.debug(f"Signaling stop for '{job.title}' during queue clear.")
-            
-            for job in self.jobs:
-                if job.thread and job.thread.is_alive():
-                    job.thread.join(timeout=5) # Increased timeout for robustness
-                    if job.thread.is_alive():
-                        logger.warning(f"Thread for '{job.title}' did not terminate gracefully during queue clear.")
-                    for temp_f in job.temp_files:
-                        if os.path.exists(temp_f):
-                            try:
-                                os.remove(temp_f)
-                                logger.debug(f"Cleaned up temp file on clear: {temp_f}")
-                            except Exception as e:
-                                logger.error(f"Error cleaning up temp file {temp_f} on clear: {e}")
-                    job.temp_files.clear()
-            self.jobs.clear() 
+        
+        # Disable buttons to prevent multiple clicks
+        self.clear_btn['state'] = 'disabled'
+        self.start_all_btn['state'] = 'disabled'
+        self.add_job_btn['state'] = 'disabled'
+        self.download_now_btn['state'] = 'disabled'
+        
+        def clear_queue_worker():
+            try:
+                with self.jobs_lock:
+                    # First signal all downloads to stop
+                    for job in self.jobs:
+                        if job.thread and job.thread.is_alive():
+                            job.stop_event.set()
+                            logger.debug(f"Signaling stop for '{job.title}' during queue clear.")
+                    
+                    # Clear the treeview immediately
+                    self.jobs_tree.delete(*self.jobs_tree.get_children())
+                    
+                    # Update UI to show clearing status
+                    self.ui_queue.put((None, 'status_update', "Clearing", "Clearing queue and stopping downloads..."))
+                    
+                    # Clean up jobs in parallel
+                    def cleanup_job(job):
+                        if job.thread and job.thread.is_alive():
+                            job.thread.join(timeout=3)  # Reduced timeout for faster cleanup
+                            if job.thread.is_alive():
+                                logger.warning(f"Thread for '{job.title}' did not terminate gracefully during queue clear.")
+                        
+                        # Clean up temp files
+                        for temp_f in job.temp_files:
+                            if os.path.exists(temp_f):
+                                try:
+                                    os.remove(temp_f)
+                                    logger.debug(f"Cleaned up temp file on clear: {temp_f}")
+                                except Exception as e:
+                                    logger.error(f"Error cleaning up temp file {temp_f} on clear: {e}")
+                        job.temp_files.clear()
 
-        self.jobs_tree.delete(*self.jobs_tree.get_children())
-        self.status_var.set("Cleared download queue.")
-        self.progress_var.set(0)
-        self.on_job_select(None)
-        self.save_queue()
-        logger.info("Download queue cleared.")
+                        try:
+                            base_outtmpl_no_ext = os.path.join(job.out_dir, sanitize_filename(job.title))
+                            base_name = os.path.basename(base_outtmpl_no_ext)
+                            sanitized_title = sanitize_filename(job.title)
+                            valid_media_exts = ['.mp4', '.mp3', '.mkv', '.webm', '.aac', '.m4a', '.flac', '.wav']
+                            
+                            # Function to attempt file deletion with retries
+                            def try_remove_file(file_path, max_retries=5, delay=0.7):
+                                for attempt in range(max_retries):
+                                    try:
+                                        if os.path.exists(file_path):
+                                            os.remove(file_path)
+                                            logger.debug(f"Cleaned up file: {file_path}")
+                                            return True
+                                    except Exception as e:
+                                        if attempt < max_retries - 1:
+                                            logger.debug(f"Retry {attempt + 1}/{max_retries} for {file_path}: {e}")
+                                            time.sleep(delay)
+                                        else:
+                                            logger.error(f"Failed to clean up file {file_path} after {max_retries} attempts: {e}")
+                                return False
+
+                            # Clean up partial/extensionless files (but NOT the main completed file)
+                            for ext in ['.mp4', '.mp3', '.aac', '.m4a', '.webm', '.part', '.webp']:
+                                # Only delete if not a valid completed file
+                                if ext in valid_media_exts:
+                                    # Only delete _video, _audio, and numbered files, NOT the main file
+                                    possible_files = [
+                                        f"{base_outtmpl_no_ext}_video{ext}",
+                                        f"{base_outtmpl_no_ext}_audio{ext}",
+                                        f"{sanitized_title}_video{ext}",
+                                        f"{sanitized_title}_audio{ext}"
+                                    ]
+                                else:
+                                    # For .part, .webp, etc., also include the base and sanitized title
+                                    possible_files = [
+                                        f"{base_outtmpl_no_ext}{ext}",
+                                        f"{base_outtmpl_no_ext}_video{ext}",
+                                        f"{base_outtmpl_no_ext}_audio{ext}",
+                                        f"{sanitized_title}{ext}",
+                                        f"{sanitized_title}_video{ext}",
+                                        f"{sanitized_title}_audio{ext}"
+                                    ]
+
+                            # Clean up extensionless temp files (_video, _audio only)
+                            extensionless_files = [
+                                f"{base_outtmpl_no_ext}_video",
+                                f"{base_outtmpl_no_ext}_audio",
+                                f"{sanitized_title}_video",
+                                f"{sanitized_title}_audio"
+                            ]
+                            for file_path in extensionless_files:
+                                try_remove_file(file_path)
+
+                            directories_to_check = [job.out_dir, os.getcwd()]
+                            for directory in directories_to_check:
+                                if os.path.isdir(directory):
+                                    for filename in os.listdir(directory):
+                                        # Check for fragment files that match the base name or sanitized title
+                                        if ((filename.startswith(base_name) or filename.startswith(sanitized_title)) and 
+                                            ('.part-Frag' in filename or filename.endswith('.part') or filename.endswith('.webp'))):
+                                            file_path = os.path.join(directory, filename)
+                                            try_remove_file(file_path, max_retries=8, delay=1.0)
+
+                            # Final check and cleanup after a short delay
+                            time.sleep(2)
+                            for directory in directories_to_check:
+                                if os.path.isdir(directory):
+                                    for filename in os.listdir(directory):
+                                        if ((filename.startswith(base_name) or filename.startswith(sanitized_title)) and 
+                                            ('.part-Frag' in filename or filename.endswith('.part') or filename.endswith('.webp'))):
+                                            file_path = os.path.join(directory, filename)
+                                            try_remove_file(file_path, max_retries=4, delay=0.5)
+
+                        except Exception as cleanup_error:
+                            logger.error(f"Error during cleanup of partial download files: {cleanup_error}")    
+                                
+                                # Create and start cleanup threads
+                        cleanup_threads = []
+                        for job in self.jobs:
+                            thread = threading.Thread(target=cleanup_job, args=(job,))
+                            thread.daemon = True
+                            thread.start()
+                            cleanup_threads.append(thread)
+                    
+                    # Wait for all cleanup threads with a timeout
+                        for thread in cleanup_threads:
+                            thread.join(timeout=3)
+                    
+                    # Clear the jobs list
+                    self.jobs.clear()
+                
+                # Update UI after cleanup
+                self.ui_queue.put((None, 'status_update', "Cleared", "Download queue cleared."))
+                self.progress_var.set(0)
+                self.status_var.set("Queue cleared.")
+                
+            except Exception as e:
+                logger.exception("Error during queue clear operation")
+                self.ui_queue.put((None, 'status_update', "Error", f"Error clearing queue: {str(e)}"))
+            
+            finally:
+                # Re-enable buttons
+                self.clear_btn['state'] = 'normal'
+                self.start_all_btn['state'] = 'normal'
+                self.add_job_btn['state'] = 'normal'
+                self.download_now_btn['state'] = 'normal'
+                self.save_queue()
+        
+        # Start the cleanup in a separate thread
+        threading.Thread(target=clear_queue_worker, daemon=True).start()
 
     def clear_finished_or_errored_jobs(self):
         if not messagebox.askyesno("Clear Finished/Errored", "Are you sure you want to remove all completed and errored jobs from the queue?"):
@@ -1523,8 +2046,8 @@ class YTDownloaderApp(ttk.Window):
         self.on_job_select(None)
 
     def show_about(self):
-        messagebox.showinfo("About YouTube Downloader",
-                             "YouTube Downloader\n\n"
+        messagebox.showinfo("About URL VideoDownloader",
+                             "URL Video Downloader\n\n"
                              "Built with yt-dlp and Tkinter (ttkbootstrap).\n"
                              "Features:\n"
                              "- Fetch video/audio formats\n"
@@ -1533,7 +2056,9 @@ class YTDownloaderApp(ttk.Window):
                              "- Download subtitles\n"
                              "- Persistent queue: Downloads are saved/loaded on app restart.\n\n"
                              "**IMPORTANT:** Ensure 'yt-dlp' and 'ffmpeg' (for merging/conversion) are installed and in your system's PATH. If not, please install them for full functionality.\n"
-                             "For FFmpeg, visit: https://ffmpeg.org/download.html"
+                             "For FFmpeg, visit: https://ffmpeg.org/download.html \n\n"
+                             "- FULLY WORKING AND TESTED ON WINDOWS 11\n"
+                             "- FUlly created BY AATHI"
                             )
         logger.info("About dialog displayed.")
 
@@ -1567,7 +2092,8 @@ class YTDownloaderApp(ttk.Window):
                     job.temp_files.clear()
         
         logger.info("All active download threads terminated (or timed out). Exiting application.")
-        self.destroy() # Close the Tkinter window
+        self.quit()  
+        self.destroy()  
 
 if __name__ == "__main__":
     app = YTDownloaderApp()
